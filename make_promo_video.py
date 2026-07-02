@@ -99,6 +99,62 @@ def normalize_shots(shots: list[str], out_dir: str, size=(1920, 1080), bg="#f5f6
     return out
 
 
+# ============ LLM 写文案 ============
+
+def llm_write_script(shots, topic, llm_url, api_key, model, n_samples=3):
+    """调视觉 LLM（默认 GLM-4V-Flash @ 8770）看截图 + 主题，生成短视频文案（每行一句）"""
+    import requests, base64
+    # 均匀采样 n_samples 张代表截图
+    if len(shots) > n_samples:
+        idx = [int(i * (len(shots) - 1) / (n_samples - 1)) for i in range(n_samples)]
+        sample = [shots[i] for i in idx]
+    else:
+        sample = list(shots)
+    prompt = (
+        f"这是「{topic}」的视频截图（按时间顺序）。写一个 25-35 秒的短视频口播文案，硬性要求：\n"
+        "- 一共 5-6 句，每句 15-25 字，总字数不超过 130 字\n"
+        "- 第 1 句必须抓眼球（提问/反差/数字开头），禁止「大家好」「今天我们来聊聊」之类套话\n"
+        "- 口语化、短句、快节奏，适合 1.25 倍速配音\n"
+        "- 准确反映截图画面内容，紧扣主题\n"
+        "- 只输出文案正文（每句一行），不要序号、不要解释、不要 markdown、不要结束语套话\n"
+    )
+    content = [{"type": "text", "text": prompt}]
+    from io import BytesIO
+    for s in sample:
+        im = Image.open(s).convert("RGB")
+        if max(im.size) > 1280:                        # 缩到最长边 1280，避免 base64 过大被拒
+            im.thumbnail((1280, 1280))
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    r = requests.post(f"{llm_url}/chat/completions",
+                      json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0.7},
+                      headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                      timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"LLM 返回 {r.status_code}: {r.text[:400]}")
+    text = r.json()["choices"][0]["message"]["content"]
+    # 先按换行分
+    lines = []
+    for l in text.split("\n"):
+        l = l.strip()
+        if not l:
+            continue
+        l = re.sub(r"^[\d]+[.、)]\s*", "", l)      # 去序号
+        l = re.sub(r"^[-•*]\s*", "", l)             # 去 bullet
+        l = l.strip("`\"' ")
+        if len(l) > 3:
+            lines.append(l)
+    # 若 LLM 没换行（写成整段），按句末标点断句
+    if len(lines) <= 2:
+        parts = re.split(r"(?<=[。！？\!\?])", text)
+        lines = [p.strip().strip("`\"' ") for p in parts if len(p.strip()) > 4]
+    if not lines:
+        raise ValueError(f"LLM 没生成有效文案，原始返回：{text[:200]}")
+    return lines
+
+
 # ============ TTS ============
 
 def tts_qwen3_local(text, api_url, instruction, out_wav, mode="design",
@@ -193,7 +249,11 @@ def main():
     src = ap.add_argument_group("输入素材")
     src.add_argument("--html", help="图文教程 HTML（自动提取 base64 截图）")
     src.add_argument("--shots", help="截图目录（与 --html 二选一）")
-    src.add_argument("--script", required=True, help="文案 txt（每行一段）")
+    src.add_argument("--script", help="文案 txt（每行一段，与 --topic 二选一）")
+    src.add_argument("--topic", help="视频主题（不提供 --script 时，用 LLM 看截图自动写文案）")
+    src.add_argument("--llm-url", default="http://127.0.0.1:8770/v1", help="视觉 LLM 端点（默认 glm-vision-proxy 8770）")
+    src.add_argument("--llm-key", default="sk-glm-vision")
+    src.add_argument("--llm-model", default="glm-4v-flash")
     src.add_argument("--bgm", help="背景音乐 mp3/m4a/wav")
     src.add_argument("--mapping", help="图文对应 JSON：[[1],[2,3],...] 每段对应截图索引")
 
@@ -208,6 +268,7 @@ def main():
 
     out = ap.add_argument_group("输出/其他")
     out.add_argument("--bgm-volume", type=float, default=0.18, help="BGM 音量 0-1")
+    out.add_argument("--voice-file", help="已有配音 wav/mp3（提供则跳过 TTS，用于外部生成的配音）")
     out.add_argument("--font", help="字幕字体 .otf/.ttc/.ttf")
     out.add_argument("--workdir", default="/tmp/doc2video_work")
     out.add_argument("-o", "--output", required=True, help="输出 mp4")
@@ -230,15 +291,26 @@ def main():
     print(f"   提取 {len(shots)} 张截图")
     shots = normalize_shots(shots, shots_norm)
 
-    # 2. 文案
-    lines = [l.strip() for l in Path(args.script).read_text(encoding="utf-8").splitlines() if l.strip()]
+    # 2. 文案（--script 文件 或 --topic 用 LLM 生成）
+    if args.script:
+        lines = [l.strip() for l in Path(args.script).read_text(encoding="utf-8").splitlines() if l.strip()]
+    elif args.topic:
+        print(f"🤖 [1.5/5] LLM 看截图写文案 ({args.llm_model})...")
+        lines = llm_write_script(shots, args.topic, args.llm_url, args.llm_key, args.llm_model)
+        (wd / "script_auto.txt").write_text("\n".join(lines), encoding="utf-8")
+        print(f"   自动文案已存: {wd / 'script_auto.txt'}")
+    else:
+        sys.exit("❌ 需要 --script（文案文件）或 --topic（主题，LLM 自动写文案）")
     text = "".join(lines)
     print(f"📝 [2/5] 文案 {len(text)} 字, {len(lines)} 段")
 
-    # 3. TTS
-    print(f"🔊 [3/5] TTS 配音 ({args.tts})...")
+    # 3. TTS（或用已有配音）
+    print(f"🔊 [3/5] 配音...")
     voice_raw = wd / "voice_raw.wav"; voice = wd / "voice.wav"
-    if args.tts == "qwen3_local":
+    if args.voice_file:
+        print(f"   使用已有配音: {args.voice_file}")
+        shutil.copy(args.voice_file, voice)
+    elif args.tts == "qwen3_local":
         secs = tts_qwen3_local(text, args.tts_url, args.instruction, voice_raw)
         print(f"   qwen3_local 生成完成 (模型耗时 {secs}s)")
         atempo_speed(voice_raw, args.speed, voice)
